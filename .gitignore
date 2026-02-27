@@ -1,0 +1,6 @@
+# Binary
+clashmask
+clashmask.exe
+
+# Desensitization outputs
+*.maskmap.json
