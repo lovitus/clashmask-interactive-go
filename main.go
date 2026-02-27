@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -125,8 +126,7 @@ func runMaskInteractive(reader *bufio.Reader) error {
 		}
 	}
 
-	defaultMap := inputPath + ".maskmap.json"
-	mapPath, err := promptRequired(reader, "Map file path (required for restore)", defaultMap)
+	mapPath, err := buildGeneratedMapPath(outPath)
 	if err != nil {
 		return err
 	}
@@ -167,7 +167,7 @@ func runMaskInteractive(reader *bufio.Reader) error {
 	fmt.Println("")
 	fmt.Println("Mask complete")
 	fmt.Println("masked file:", outPath)
-	fmt.Println("map file:", mapPath)
+	fmt.Println("map file (auto-generated):", mapPath)
 	fmt.Println("To restore, run this program again and choose 2 (Unmask).")
 	return nil
 }
@@ -184,7 +184,7 @@ func runUnmaskInteractive(reader *bufio.Reader) error {
 		return err
 	}
 
-	mapPath, err := promptRequired(reader, "Map file path", inputPath+".maskmap.json")
+	mapPath, err := selectMapPathInteractive(reader)
 	if err != nil {
 		return err
 	}
@@ -244,6 +244,13 @@ func prompt(reader *bufio.Reader, label string, def string) (string, error) {
 		if errors.Is(err, os.ErrClosed) {
 			return "", err
 		}
+		if errors.Is(err, io.EOF) {
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				return "", io.EOF
+			}
+			return raw, nil
+		}
 		if raw == "" {
 			return "", err
 		}
@@ -283,6 +290,89 @@ func addSuffixBeforeExt(path string, suffix string) string {
 	}
 	base := strings.TrimSuffix(path, ext)
 	return base + suffix + ext
+}
+
+func buildGeneratedMapPath(targetPath string) (string, error) {
+	ext := filepath.Ext(targetPath)
+	base := strings.TrimSuffix(targetPath, ext)
+	if base == "" {
+		base = targetPath
+	}
+	candidate := base + ".maskmap.json"
+	if !fileExists(candidate) {
+		return candidate, nil
+	}
+	stamp := time.Now().Format("20060102_150405")
+	candidate = base + "." + stamp + ".maskmap.json"
+	if !fileExists(candidate) {
+		return candidate, nil
+	}
+	for i := 1; i <= 999; i++ {
+		next := base + "." + stamp + "_" + strconv.Itoa(i) + ".maskmap.json"
+		if !fileExists(next) {
+			return next, nil
+		}
+	}
+	return "", errors.New("unable to create unique map path")
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func selectMapPathInteractive(reader *bufio.Reader) (string, error) {
+	files, err := discoverMapFilesInCWD()
+	if err != nil {
+		return "", err
+	}
+	if len(files) == 0 {
+		return promptRequired(reader, "No map file found in current directory, enter map file path", "")
+	}
+
+	fmt.Println("Map files in current directory:")
+	for i, f := range files {
+		fmt.Printf("%d) %s\n", i+1, f)
+	}
+	fmt.Println("0) Enter path manually")
+
+	for {
+		raw, err := promptRequired(reader, "Choose map file number", "1")
+		if err != nil {
+			return "", err
+		}
+		n, convErr := strconv.Atoi(strings.TrimSpace(raw))
+		if convErr != nil {
+			fmt.Println("please input a valid number")
+			continue
+		}
+		if n == 0 {
+			return promptRequired(reader, "Map file path", "")
+		}
+		if n >= 1 && n <= len(files) {
+			return files[n-1], nil
+		}
+		fmt.Println("number out of range")
+	}
+}
+
+func discoverMapFilesInCWD() ([]string, error) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		return nil, err
+	}
+	files := make([]string, 0, len(entries))
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		name := ent.Name()
+		if strings.HasSuffix(name, ".maskmap.json") {
+			files = append(files, name)
+		}
+	}
+	sort.Strings(files)
+	return files, nil
 }
 
 func NewSanitizer(cfg Config) (*Sanitizer, error) {
