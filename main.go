@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"encoding/json"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -45,16 +47,25 @@ var DefaultSecretKeys = []string{
 	"secret",
 }
 
+const (
+	MapVersion = 2
+	MapTool    = "clashmask"
+)
+
+var proxiesStartRe = regexp.MustCompile(`(?i)^\s*(?:[{,]\s*)?["']?proxies["']?\s*:\s*(.*)$`)
+
 type Config struct {
 	HostKeys   []string
 	SecretKeys []string
 }
 
 type TokenMap struct {
-	Version   int               `json:"version"`
-	CreatedAt string            `json:"created_at"`
-	Host      map[string]string `json:"host"`
-	Secret    map[string]string `json:"secret"`
+	Version      int               `json:"version"`
+	Tool         string            `json:"tool"`
+	CreatedAt    string            `json:"created_at"`
+	MaskedSHA256 string            `json:"masked_sha256"`
+	Host         map[string]string `json:"host"`
+	Secret       map[string]string `json:"secret"`
 }
 
 type Sanitizer struct {
@@ -160,7 +171,7 @@ func runMaskInteractive(reader *bufio.Reader) error {
 	if err := os.WriteFile(outPath, []byte(masked), 0o644); err != nil {
 		return err
 	}
-	if err := SaveTokenMap(mapPath, sanitizer.ExportMap()); err != nil {
+	if err := SaveTokenMap(mapPath, sanitizer.ExportMap(masked)); err != nil {
 		return err
 	}
 
@@ -190,6 +201,9 @@ func runUnmaskInteractive(reader *bufio.Reader) error {
 	}
 	mapping, err := LoadTokenMap(mapPath)
 	if err != nil {
+		return err
+	}
+	if err := ValidateMapForMaskedContent(mapping, data); err != nil {
 		return err
 	}
 
@@ -447,14 +461,102 @@ func leftPadInt(n int, width int) string {
 }
 
 func (s *Sanitizer) MaskText(input string) string {
-	return transformByLine(input, func(code string) string {
-		masked := code
-		masked = s.replaceKV(masked, s.secretKVRe, s.secretToken)
-		masked = s.replaceKV(masked, s.hostKVRe, s.hostToken)
-		masked = s.replaceURICredentials(masked)
-		masked = s.replaceURIHosts(masked)
-		return masked
-	})
+	if input == "" {
+		return ""
+	}
+
+	var out strings.Builder
+	start := 0
+	inProxies := false
+	proxiesIndent := 0
+	jsonArrayMode := false
+	jsonArrayDepth := 0
+
+	for start < len(input) {
+		rel := strings.IndexByte(input[start:], '\n')
+		line := ""
+		newline := ""
+		if rel == -1 {
+			line = input[start:]
+			start = len(input)
+		} else {
+			pos := start + rel
+			line = input[start:pos]
+			newline = "\n"
+			start = pos + 1
+		}
+
+		code, comment := splitCodeAndComment(line)
+		trimmed := strings.TrimSpace(code)
+		indent := leadingIndentWidth(code)
+		maskThisLine := false
+		startedProxiesNow := false
+
+		if inProxies {
+			if jsonArrayMode {
+				maskThisLine = true
+			} else {
+				if trimmed == "" {
+					maskThisLine = true
+				} else if indent > proxiesIndent {
+					maskThisLine = true
+				} else {
+					inProxies = false
+					jsonArrayMode = false
+					jsonArrayDepth = 0
+				}
+			}
+		}
+
+		if !inProxies {
+			if ok, afterColon := parseProxiesStart(code); ok {
+				inProxies = true
+				startedProxiesNow = true
+				maskThisLine = true
+				proxiesIndent = indent
+				jsonArrayMode = false
+				jsonArrayDepth = 0
+
+				if strings.Contains(afterColon, "[") {
+					jsonArrayMode = true
+					jsonArrayDepth = bracketDeltaIgnoringQuotes(afterColon)
+					if jsonArrayDepth <= 0 {
+						inProxies = false
+						jsonArrayMode = false
+						jsonArrayDepth = 0
+					}
+				}
+			}
+		}
+
+		if maskThisLine {
+			code = s.maskCodeSegment(code)
+		}
+
+		if inProxies && jsonArrayMode && !startedProxiesNow {
+			jsonArrayDepth += bracketDeltaIgnoringQuotes(code)
+			if jsonArrayDepth <= 0 {
+				inProxies = false
+				jsonArrayMode = false
+				jsonArrayDepth = 0
+			}
+		}
+
+		out.WriteString(code)
+		out.WriteString(comment)
+		out.WriteString(newline)
+	}
+
+	return out.String()
+}
+
+func (s *Sanitizer) maskCodeSegment(code string) string {
+	masked := code
+	masked = s.replaceKV(masked, s.secretKVRe, s.secretToken)
+	masked = s.replaceKV(masked, s.hostKVRe, s.hostToken)
+	masked = s.replaceURICredentials(masked)
+	masked = s.replaceURIHosts(masked)
+	return masked
 }
 
 func (s *Sanitizer) replaceKV(input string, re *regexp.Regexp, tokenFn func(string) string) string {
@@ -533,7 +635,7 @@ func (s *Sanitizer) replaceURIHosts(input string) string {
 	})
 }
 
-func (s *Sanitizer) ExportMap() TokenMap {
+func (s *Sanitizer) ExportMap(masked string) TokenMap {
 	host := make(map[string]string, len(s.hostTokenToOriginal))
 	for k, v := range s.hostTokenToOriginal {
 		host[k] = v
@@ -543,11 +645,18 @@ func (s *Sanitizer) ExportMap() TokenMap {
 		secret[k] = v
 	}
 	return TokenMap{
-		Version:   1,
-		CreatedAt: time.Now().UTC().Format(time.RFC3339),
-		Host:      host,
-		Secret:    secret,
+		Version:      MapVersion,
+		Tool:         MapTool,
+		CreatedAt:    time.Now().UTC().Format(time.RFC3339),
+		MaskedSHA256: sha256HexString(masked),
+		Host:         host,
+		Secret:       secret,
 	}
+}
+
+func sha256HexString(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
 }
 
 func transformByLine(input string, transform func(string) string) string {
@@ -655,6 +764,21 @@ func SaveTokenMap(path string, m TokenMap) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
+func ValidateMapForMaskedContent(m TokenMap, maskedData []byte) error {
+	if strings.TrimSpace(m.Tool) != MapTool {
+		return errors.New("selected map is not generated by clashmask")
+	}
+	if strings.TrimSpace(m.MaskedSHA256) == "" {
+		return errors.New("selected map has no masked content fingerprint")
+	}
+	current := sha256.Sum256(maskedData)
+	currentHex := hex.EncodeToString(current[:])
+	if !strings.EqualFold(strings.TrimSpace(m.MaskedSHA256), currentHex) {
+		return errors.New("selected map does not match the current masked file")
+	}
+	return nil
+}
+
 func UnmaskText(masked string, m TokenMap) string {
 	replacements := make([][2]string, 0, len(m.Host)+len(m.Secret))
 	for token, origin := range m.Host {
@@ -686,4 +810,71 @@ func parseCSV(input string) []string {
 		}
 	}
 	return result
+}
+
+func parseProxiesStart(code string) (bool, string) {
+	m := proxiesStartRe.FindStringSubmatch(code)
+	if len(m) < 2 {
+		return false, ""
+	}
+	return true, m[1]
+}
+
+func leadingIndentWidth(line string) int {
+	n := 0
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case ' ':
+			n++
+		case '\t':
+			n += 4
+		default:
+			return n
+		}
+	}
+	return n
+}
+
+func bracketDeltaIgnoringQuotes(input string) int {
+	inSingle := false
+	inDouble := false
+	escaped := false
+	delta := 0
+	for i := 0; i < len(input); i++ {
+		ch := input[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if inDouble {
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inSingle {
+			if ch == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		if ch == '"' {
+			inDouble = true
+			continue
+		}
+		if ch == '\'' {
+			inSingle = true
+			continue
+		}
+		if ch == '[' {
+			delta++
+		} else if ch == ']' {
+			delta--
+		}
+	}
+	return delta
 }
