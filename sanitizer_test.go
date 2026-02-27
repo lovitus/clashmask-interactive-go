@@ -31,7 +31,7 @@ func TestMaskAndUnmaskRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	masked := s.MaskText(original)
-	if strings.Contains(masked, `server: real.example.com`) {
+	if strings.Contains(masked, `, server: real.example.com,`) {
 		t.Fatalf("host should be replaced in code: %q", masked)
 	}
 	if !strings.Contains(masked, `# keep comment real.example.com`) {

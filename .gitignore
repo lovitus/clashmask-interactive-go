@@ -4,3 +4,6 @@ clashmask.exe
 
 # Desensitization outputs
 *.maskmap.json
+
+# Local Go cache
+.gocache/
