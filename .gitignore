@@ -7,3 +7,6 @@ clashmask.exe
 
 # Local Go cache
 .gocache/
+
+# Build artifacts
+dist/
