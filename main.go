@@ -54,6 +54,7 @@ const (
 
 var proxyRootStartRe = regexp.MustCompile(`(?i)^\s*(?:[{,]\s*)?["']?(proxy|proxies)["']?\s*:\s*(.*)$`)
 var singboxRootStartRe = regexp.MustCompile(`(?i)^\s*(?:[{,]\s*)?["']?(outbounds|inbounds|endpoints)["']?\s*:\s*(.*)$`)
+var singboxRootJSONKeyRe = regexp.MustCompile(`(?i)"(outbounds|inbounds|endpoints)"\s*:\s*`)
 
 const (
 	maskModeClash   = "clash"
@@ -504,6 +505,9 @@ func discoverMaskCandidateFilesInDir(dir string) ([]string, error) {
 		}
 		name := ent.Name()
 		lower := strings.ToLower(name)
+		if strings.HasSuffix(lower, ".maskmap.json") {
+			continue
+		}
 		if strings.HasSuffix(lower, ".yaml") || strings.HasSuffix(lower, ".yml") || strings.HasSuffix(lower, ".json") || strings.HasSuffix(lower, ".jsonc") {
 			files = append(files, name)
 		}
@@ -763,6 +767,16 @@ func (s *Sanitizer) maskClashText(input string) string {
 }
 
 func (s *Sanitizer) maskSingboxText(input string) string {
+	beforeHost := s.hostCounter
+	beforeSecret := s.secretCounter
+	lineBased := s.maskSingboxTextByLine(input)
+	if s.hostCounter > beforeHost || s.secretCounter > beforeSecret {
+		return lineBased
+	}
+	return s.maskSingboxTextByJSONRootSections(input)
+}
+
+func (s *Sanitizer) maskSingboxTextByLine(input string) string {
 	if input == "" {
 		return ""
 	}
@@ -834,6 +848,63 @@ func (s *Sanitizer) maskSingboxText(input string) string {
 		out.WriteString(newline)
 	}
 	return out.String()
+}
+
+func (s *Sanitizer) maskSingboxTextByJSONRootSections(input string) string {
+	if input == "" {
+		return ""
+	}
+	matches := singboxRootJSONKeyRe.FindAllStringSubmatchIndex(input, -1)
+	if len(matches) == 0 {
+		return input
+	}
+
+	type span struct {
+		start int
+		end   int
+	}
+	spans := make([]span, 0, len(matches))
+
+	for _, m := range matches {
+		if len(m) < 2 {
+			continue
+		}
+		fullStart := m[0]
+		fullEnd := m[1]
+		braceDepth, bracketDepth := jsonDepthAtIndex(input, fullStart)
+		if braceDepth != 1 || bracketDepth != 0 {
+			continue
+		}
+
+		valueStart := skipSpaces(input, fullEnd)
+		if valueStart >= len(input) {
+			continue
+		}
+		valueEnd := parseJSONValueEnd(input, valueStart)
+		if valueEnd <= valueStart {
+			continue
+		}
+		spans = append(spans, span{start: valueStart, end: valueEnd})
+	}
+
+	if len(spans) == 0 {
+		return input
+	}
+
+	sort.Slice(spans, func(i, j int) bool {
+		return spans[i].start > spans[j].start
+	})
+
+	out := input
+	for _, sp := range spans {
+		if sp.start < 0 || sp.end > len(out) || sp.start >= sp.end {
+			continue
+		}
+		segment := out[sp.start:sp.end]
+		replaced := s.maskCodeSegment(segment)
+		out = out[:sp.start] + replaced + out[sp.end:]
+	}
+	return out
 }
 
 func (s *Sanitizer) maskCodeSegment(code string) string {
@@ -1148,6 +1219,137 @@ func parseSingboxRootStart(code string, globalBraceDepth int) (bool, string) {
 		return true, m[2]
 	}
 	return true, ""
+}
+
+func skipSpaces(input string, idx int) int {
+	for idx < len(input) {
+		switch input[idx] {
+		case ' ', '\t', '\n', '\r':
+			idx++
+		default:
+			return idx
+		}
+	}
+	return idx
+}
+
+func jsonDepthAtIndex(input string, idx int) (braceDepth int, bracketDepth int) {
+	inString := false
+	escaped := false
+	for i := 0; i < len(input) && i < idx; i++ {
+		ch := input[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+		if ch == '"' {
+			inString = true
+			continue
+		}
+		switch ch {
+		case '{':
+			braceDepth++
+		case '}':
+			braceDepth--
+		case '[':
+			bracketDepth++
+		case ']':
+			bracketDepth--
+		}
+		if braceDepth < 0 {
+			braceDepth = 0
+		}
+		if bracketDepth < 0 {
+			bracketDepth = 0
+		}
+	}
+	return braceDepth, bracketDepth
+}
+
+func parseJSONValueEnd(input string, start int) int {
+	if start >= len(input) {
+		return start
+	}
+	switch input[start] {
+	case '{', '[':
+		inString := false
+		escaped := false
+		depthObj := 0
+		depthArr := 0
+		for i := start; i < len(input); i++ {
+			ch := input[i]
+			if inString {
+				if escaped {
+					escaped = false
+					continue
+				}
+				if ch == '\\' {
+					escaped = true
+					continue
+				}
+				if ch == '"' {
+					inString = false
+				}
+				continue
+			}
+			if ch == '"' {
+				inString = true
+				continue
+			}
+			switch ch {
+			case '{':
+				depthObj++
+			case '}':
+				depthObj--
+			case '[':
+				depthArr++
+			case ']':
+				depthArr--
+			}
+			if depthObj <= 0 && depthArr <= 0 {
+				return i + 1
+			}
+		}
+		return len(input)
+	case '"':
+		escaped := false
+		for i := start + 1; i < len(input); i++ {
+			ch := input[i]
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				return i + 1
+			}
+		}
+		return len(input)
+	default:
+		i := start
+		for i < len(input) {
+			switch input[i] {
+			case ',', '}', ']':
+				return i
+			default:
+				i++
+			}
+		}
+		return len(input)
+	}
 }
 
 func leadingIndentWidth(line string) int {
