@@ -3,11 +3,12 @@ package main
 import (
 	"bufio"
 	"crypto/sha256"
-	"encoding/json"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -55,6 +56,8 @@ const (
 var proxyRootStartRe = regexp.MustCompile(`(?i)^\s*(?:[{,]\s*)?["']?(proxy|proxies)["']?\s*:\s*(.*)$`)
 var singboxRootStartRe = regexp.MustCompile(`(?i)^\s*(?:[{,]\s*)?["']?(outbounds|inbounds|endpoints)["']?\s*:\s*(.*)$`)
 var singboxRootJSONKeyRe = regexp.MustCompile(`(?i)"(outbounds|inbounds|endpoints)"\s*:\s*`)
+var hostArrayStartRe = regexp.MustCompile(`(?i)["']?host["']?\s*:\s*\[`)
+var quotedStringRe = regexp.MustCompile(`"([^"\\]*(?:\\.[^"\\]*)*)"`)
 
 const (
 	maskModeClash   = "clash"
@@ -708,6 +711,7 @@ func (s *Sanitizer) maskClashText(input string) string {
 	proxiesIndent := 0
 	jsonArrayMode := false
 	jsonArrayDepth := 0
+	hostArrayDepth := 0
 
 	for start < len(input) {
 		rel := strings.IndexByte(input[start:], '\n')
@@ -725,6 +729,7 @@ func (s *Sanitizer) maskClashText(input string) string {
 
 		lineIndent := leadingIndentWidth(line)
 		code, comment := splitCodeAndComment(line)
+		originalCode := code
 		trimmed := strings.TrimSpace(code)
 		indent := leadingIndentWidth(code)
 		maskThisLine := false
@@ -749,6 +754,7 @@ func (s *Sanitizer) maskClashText(input string) string {
 					inProxies = false
 					jsonArrayMode = false
 					jsonArrayDepth = 0
+					hostArrayDepth = 0
 				}
 			}
 		}
@@ -769,24 +775,38 @@ func (s *Sanitizer) maskClashText(input string) string {
 						inProxies = false
 						jsonArrayMode = false
 						jsonArrayDepth = 0
+						hostArrayDepth = 0
 					}
 				}
 			}
 		}
 
 		if maskThisLine {
+			startHostArrayNow := hostArrayDepth == 0 && hostArrayStartRe.MatchString(originalCode)
+			if hostArrayDepth > 0 || startHostArrayNow {
+				code = s.maskHostArrayLine(code)
+			}
 			code = s.maskCodeSegment(code)
+			if startHostArrayNow {
+				hostArrayDepth = bracketDeltaIgnoringQuotes(originalCode)
+			} else if hostArrayDepth > 0 {
+				hostArrayDepth += bracketDeltaIgnoringQuotes(originalCode)
+			}
+			if hostArrayDepth < 0 {
+				hostArrayDepth = 0
+			}
 		}
 		if maskThisLine && comment != "" {
 			comment = s.maskCommentSegment(comment)
 		}
 
 		if inProxies && jsonArrayMode && !startedProxiesNow {
-			jsonArrayDepth += bracketDeltaIgnoringQuotes(code)
+			jsonArrayDepth += bracketDeltaIgnoringQuotes(originalCode)
 			if jsonArrayDepth <= 0 {
 				inProxies = false
 				jsonArrayMode = false
 				jsonArrayDepth = 0
+				hostArrayDepth = 0
 			}
 		}
 
@@ -819,6 +839,7 @@ func (s *Sanitizer) maskSingboxTextByLine(input string) string {
 	inSection := false
 	sectionDepth := 0
 	startedSectionNow := false
+	hostArrayDepth := 0
 
 	for start < len(input) {
 		rel := strings.IndexByte(input[start:], '\n')
@@ -835,6 +856,7 @@ func (s *Sanitizer) maskSingboxTextByLine(input string) string {
 		}
 
 		code, comment := splitCodeAndComment(line)
+		originalCode := code
 		maskThisLine := false
 		startedSectionNow = false
 
@@ -851,26 +873,40 @@ func (s *Sanitizer) maskSingboxTextByLine(input string) string {
 				if sectionDepth <= 0 {
 					inSection = false
 					sectionDepth = 0
+					hostArrayDepth = 0
 				}
 			}
 		}
 
 		if maskThisLine {
+			startHostArrayNow := hostArrayDepth == 0 && hostArrayStartRe.MatchString(originalCode)
+			if hostArrayDepth > 0 || startHostArrayNow {
+				code = s.maskHostArrayLine(code)
+			}
 			code = s.maskCodeSegment(code)
 			if comment != "" {
 				comment = s.maskCommentSegment(comment)
 			}
-		}
-
-		if inSection && !startedSectionNow {
-			sectionDepth += containerDeltaIgnoringQuotes(code)
-			if sectionDepth <= 0 {
-				inSection = false
-				sectionDepth = 0
+			if startHostArrayNow {
+				hostArrayDepth = bracketDeltaIgnoringQuotes(originalCode)
+			} else if hostArrayDepth > 0 {
+				hostArrayDepth += bracketDeltaIgnoringQuotes(originalCode)
+			}
+			if hostArrayDepth < 0 {
+				hostArrayDepth = 0
 			}
 		}
 
-		globalBraceDepth += braceDeltaIgnoringQuotes(code)
+		if inSection && !startedSectionNow {
+			sectionDepth += containerDeltaIgnoringQuotes(originalCode)
+			if sectionDepth <= 0 {
+				inSection = false
+				sectionDepth = 0
+				hostArrayDepth = 0
+			}
+		}
+
+		globalBraceDepth += braceDeltaIgnoringQuotes(originalCode)
 		if globalBraceDepth < 0 {
 			globalBraceDepth = 0
 		}
@@ -880,6 +916,87 @@ func (s *Sanitizer) maskSingboxTextByLine(input string) string {
 		out.WriteString(newline)
 	}
 	return out.String()
+}
+
+func (s *Sanitizer) maskHostArrayLine(line string) string {
+	return quotedStringRe.ReplaceAllStringFunc(line, func(match string) string {
+		start := strings.Index(line, match)
+		if start == -1 {
+			return match
+		}
+		end := start + len(match)
+		// Keep key strings untouched: e.g. "Host":
+		if next, ok := nextNonSpaceByte(line, end); ok && next == ':' {
+			return match
+		}
+
+		raw, err := strconv.Unquote(match)
+		if err != nil {
+			return match
+		}
+		if !looksLikeHostLiteral(raw) {
+			return match
+		}
+		return strconv.Quote(s.hostToken(raw))
+	})
+}
+
+func nextNonSpaceByte(s string, idx int) (byte, bool) {
+	for i := idx; i < len(s); i++ {
+		switch s[i] {
+		case ' ', '\t', '\r', '\n':
+			continue
+		default:
+			return s[i], true
+		}
+	}
+	return 0, false
+}
+
+func looksLikeHostLiteral(raw string) bool {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return false
+	}
+	if strings.HasPrefix(v, "__CLASHMASK_HOST_") && strings.HasSuffix(v, "__") {
+		return false
+	}
+	if strings.ContainsAny(v, " /@") {
+		return false
+	}
+	if strings.Contains(v, "://") {
+		return false
+	}
+	// host:port -> inspect host part
+	if i := strings.LastIndex(v, ":"); i > 0 && i < len(v)-1 {
+		port := v[i+1:]
+		allDigit := true
+		for j := 0; j < len(port); j++ {
+			if port[j] < '0' || port[j] > '9' {
+				allDigit = false
+				break
+			}
+		}
+		if allDigit {
+			v = v[:i]
+		}
+	}
+	trimmedIP := strings.Trim(v, "[]")
+	if net.ParseIP(trimmedIP) != nil {
+		return true
+	}
+	// domain-like
+	if !strings.Contains(v, ".") {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func (s *Sanitizer) maskSingboxTextByJSONRootSections(input string) string {
@@ -978,6 +1095,13 @@ func (s *Sanitizer) replaceKV(input string, re *regexp.Regexp, tokenFn func(stri
 		}
 		if strings.TrimSpace(rawValue) == "" {
 			return match
+		}
+		if quote == "" {
+			trimmed := strings.TrimSpace(rawValue)
+			// Skip structural JSON/YAML values like arrays/objects.
+			if strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{") {
+				return match
+			}
 		}
 		token := tokenFn(rawValue)
 		if quote != "" {
