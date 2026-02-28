@@ -52,7 +52,7 @@ const (
 	MapTool    = "clashmask"
 )
 
-var proxiesStartRe = regexp.MustCompile(`(?i)^\s*(?:[{,]\s*)?["']?proxies["']?\s*:\s*(.*)$`)
+var proxyRootStartRe = regexp.MustCompile(`(?i)^\s*(?:[{,]\s*)?["']?(proxy|proxies)["']?\s*:\s*(.*)$`)
 
 type Config struct {
 	HostKeys   []string
@@ -230,7 +230,7 @@ func runUnmaskInteractive(reader *bufio.Reader) error {
 		return err
 	}
 
-	mapPath, err := selectMapPathInteractive(reader)
+	mapPath, err := selectMapPathInteractive(reader, inputPath)
 	if err != nil {
 		return err
 	}
@@ -370,7 +370,7 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-func selectMapPathInteractive(reader *bufio.Reader) (string, error) {
+func selectMapPathInteractive(reader *bufio.Reader, maskedInputPath string) (string, error) {
 	files, err := discoverMapFilesInCWD()
 	if err != nil {
 		return "", err
@@ -385,8 +385,19 @@ func selectMapPathInteractive(reader *bufio.Reader) (string, error) {
 	}
 	fmt.Println("0) Enter path manually")
 
+	defaultChoice := "1"
+	expected := defaultMapFilenameForMaskedInput(maskedInputPath)
+	if expected != "" {
+		for i, f := range files {
+			if f == expected {
+				defaultChoice = strconv.Itoa(i + 1)
+				break
+			}
+		}
+	}
+
 	for {
-		raw, err := promptRequired(reader, "Choose map file number", "1")
+		raw, err := promptRequired(reader, "Choose map file number", defaultChoice)
 		if err != nil {
 			return "", err
 		}
@@ -403,6 +414,15 @@ func selectMapPathInteractive(reader *bufio.Reader) (string, error) {
 		}
 		fmt.Println("number out of range")
 	}
+}
+
+func defaultMapFilenameForMaskedInput(maskedInputPath string) string {
+	base := filepath.Base(maskedInputPath)
+	ext := filepath.Ext(base)
+	if ext == "" {
+		return base + ".maskmap.json"
+	}
+	return strings.TrimSuffix(base, ext) + ".maskmap.json"
 }
 
 func discoverMapFilesInCWD() ([]string, error) {
@@ -541,6 +561,7 @@ func (s *Sanitizer) MaskText(input string) string {
 			start = pos + 1
 		}
 
+		lineIndent := leadingIndentWidth(line)
 		code, comment := splitCodeAndComment(line)
 		trimmed := strings.TrimSpace(code)
 		indent := leadingIndentWidth(code)
@@ -552,7 +573,14 @@ func (s *Sanitizer) MaskText(input string) string {
 				maskThisLine = true
 			} else {
 				if trimmed == "" {
-					maskThisLine = true
+					// If the line is a root-level comment, treat it as outside the proxy block.
+					if comment != "" && lineIndent <= proxiesIndent {
+						inProxies = false
+						jsonArrayMode = false
+						jsonArrayDepth = 0
+					} else {
+						maskThisLine = true
+					}
 				} else if indent > proxiesIndent {
 					maskThisLine = true
 				} else {
@@ -564,7 +592,7 @@ func (s *Sanitizer) MaskText(input string) string {
 		}
 
 		if !inProxies {
-			if ok, afterColon := parseProxiesStart(code); ok {
+			if ok, afterColon := parseProxyRootStart(code, indent); ok {
 				inProxies = true
 				startedProxiesNow = true
 				maskThisLine = true
@@ -587,7 +615,7 @@ func (s *Sanitizer) MaskText(input string) string {
 		if maskThisLine {
 			code = s.maskCodeSegment(code)
 		}
-		if comment != "" {
+		if maskThisLine && comment != "" {
 			comment = s.maskCommentSegment(comment)
 		}
 
@@ -877,12 +905,18 @@ func parseCSV(input string) []string {
 	return result
 }
 
-func parseProxiesStart(code string) (bool, string) {
-	m := proxiesStartRe.FindStringSubmatch(code)
+func parseProxyRootStart(code string, indent int) (bool, string) {
+	if indent != 0 {
+		return false, ""
+	}
+	m := proxyRootStartRe.FindStringSubmatch(code)
 	if len(m) < 2 {
 		return false, ""
 	}
-	return true, m[1]
+	if len(m) >= 3 {
+		return true, m[2]
+	}
+	return true, ""
 }
 
 func leadingIndentWidth(line string) int {
