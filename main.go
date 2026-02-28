@@ -53,6 +53,12 @@ const (
 )
 
 var proxyRootStartRe = regexp.MustCompile(`(?i)^\s*(?:[{,]\s*)?["']?(proxy|proxies)["']?\s*:\s*(.*)$`)
+var singboxRootStartRe = regexp.MustCompile(`(?i)^\s*(?:[{,]\s*)?["']?(outbounds|inbounds|endpoints)["']?\s*:\s*(.*)$`)
+
+const (
+	maskModeClash   = "clash"
+	maskModeSingbox = "singbox"
+)
 
 type Config struct {
 	HostKeys   []string
@@ -184,15 +190,15 @@ func runMaskInteractive(reader *bufio.Reader) error {
 }
 
 func selectMaskInputPathInteractive(reader *bufio.Reader) (string, error) {
-	files, err := discoverYAMLFilesInDir(".")
+	files, err := discoverMaskCandidateFilesInDir(".")
 	if err != nil {
 		return "", err
 	}
 	if len(files) == 0 {
-		return promptRequired(reader, "No .yaml/.yml found in current folder, enter input file path", "")
+		return promptRequired(reader, "No candidate config files found, enter input file path", "")
 	}
 
-	fmt.Println("YAML files in current folder:")
+	fmt.Println("Config files in current folder (.yaml/.yml/.json/.jsonc):")
 	for i, f := range files {
 		fmt.Printf("%d) %s\n", i+1, f)
 	}
@@ -394,20 +400,20 @@ func selectMapPathInteractive(reader *bufio.Reader, maskedInputPath string, inpu
 	fmt.Println("0) Enter path manually")
 
 	defaultChoice := "1"
+	expected := defaultMapFilenameForMaskedInput(maskedInputPath)
+	if expected != "" {
+		for i, f := range files {
+			if f == expected {
+				defaultChoice = strconv.Itoa(i + 1)
+				goto promptSelectMap
+			}
+		}
+	}
 	if bestIdx, bestScore := findBestMapByTokenOverlap(files, string(inputData)); bestIdx >= 0 && bestScore > 0 {
 		defaultChoice = strconv.Itoa(bestIdx + 1)
 	}
 
-	expected := defaultMapFilenameForMaskedInput(maskedInputPath)
-	if defaultChoice == "1" && expected != "" {
-		for i, f := range files {
-			if f == expected {
-				defaultChoice = strconv.Itoa(i + 1)
-				break
-			}
-		}
-	}
-
+promptSelectMap:
 	for {
 		raw, err := promptRequired(reader, "Choose map file number", defaultChoice)
 		if err != nil {
@@ -486,7 +492,7 @@ func discoverMapFilesInCWD() ([]string, error) {
 	return files, nil
 }
 
-func discoverYAMLFilesInDir(dir string) ([]string, error) {
+func discoverMaskCandidateFilesInDir(dir string) ([]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -498,7 +504,7 @@ func discoverYAMLFilesInDir(dir string) ([]string, error) {
 		}
 		name := ent.Name()
 		lower := strings.ToLower(name)
-		if strings.HasSuffix(lower, ".yaml") || strings.HasSuffix(lower, ".yml") {
+		if strings.HasSuffix(lower, ".yaml") || strings.HasSuffix(lower, ".yml") || strings.HasSuffix(lower, ".json") || strings.HasSuffix(lower, ".jsonc") {
 			files = append(files, name)
 		}
 	}
@@ -578,6 +584,84 @@ func leftPadInt(n int, width int) string {
 }
 
 func (s *Sanitizer) MaskText(input string) string {
+	mode := detectMaskMode(input)
+	if mode == maskModeSingbox {
+		return s.maskSingboxText(input)
+	}
+	return s.maskClashText(input)
+}
+
+func detectMaskMode(input string) string {
+	hasClash := hasRootKeyByLine(input, []string{"proxy", "proxies"})
+	hasSingbox := hasRootKeyByLine(input, []string{"outbounds", "inbounds", "endpoints"})
+
+	if hasClash && !hasSingbox {
+		return maskModeClash
+	}
+	if hasSingbox && !hasClash {
+		return maskModeSingbox
+	}
+	if hasSingbox && hasClash {
+		trim := strings.TrimSpace(input)
+		if strings.HasPrefix(trim, "{") || strings.HasPrefix(trim, "[") {
+			return maskModeSingbox
+		}
+		return maskModeClash
+	}
+	trim := strings.TrimSpace(input)
+	if strings.HasPrefix(trim, "{") || strings.HasPrefix(trim, "[") {
+		return maskModeSingbox
+	}
+	return maskModeClash
+}
+
+func hasRootKeyByLine(input string, keys []string) bool {
+	start := 0
+	for start < len(input) {
+		rel := strings.IndexByte(input[start:], '\n')
+		line := ""
+		if rel == -1 {
+			line = input[start:]
+			start = len(input)
+		} else {
+			pos := start + rel
+			line = input[start:pos]
+			start = pos + 1
+		}
+		code, _ := splitCodeAndComment(line)
+		trimmed := strings.TrimSpace(code)
+		if trimmed == "" {
+			continue
+		}
+		for _, key := range keys {
+			if isLikelyRootKeyLine(code, key) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isLikelyRootKeyLine(code string, key string) bool {
+	trim := strings.TrimSpace(code)
+	keyLower := strings.ToLower(key)
+	candidates := []string{
+		keyLower + ":",
+		"\"" + keyLower + "\":",
+		"'" + keyLower + "':",
+	}
+	for _, c := range candidates {
+		if strings.HasPrefix(strings.ToLower(trim), c) {
+			return true
+		}
+		if strings.HasPrefix(strings.ToLower(trim), "{"+c) || strings.HasPrefix(strings.ToLower(trim), ","+c) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Sanitizer) maskClashText(input string) string {
 	if input == "" {
 		return ""
 	}
@@ -675,6 +759,80 @@ func (s *Sanitizer) MaskText(input string) string {
 		out.WriteString(newline)
 	}
 
+	return out.String()
+}
+
+func (s *Sanitizer) maskSingboxText(input string) string {
+	if input == "" {
+		return ""
+	}
+
+	var out strings.Builder
+	start := 0
+	globalBraceDepth := 0
+	inSection := false
+	sectionDepth := 0
+	startedSectionNow := false
+
+	for start < len(input) {
+		rel := strings.IndexByte(input[start:], '\n')
+		line := ""
+		newline := ""
+		if rel == -1 {
+			line = input[start:]
+			start = len(input)
+		} else {
+			pos := start + rel
+			line = input[start:pos]
+			newline = "\n"
+			start = pos + 1
+		}
+
+		code, comment := splitCodeAndComment(line)
+		maskThisLine := false
+		startedSectionNow = false
+
+		if inSection {
+			maskThisLine = true
+		}
+
+		if !inSection {
+			if ok, afterColon := parseSingboxRootStart(code, globalBraceDepth); ok {
+				inSection = true
+				startedSectionNow = true
+				maskThisLine = true
+				sectionDepth = containerDeltaIgnoringQuotes(afterColon)
+				if sectionDepth <= 0 {
+					inSection = false
+					sectionDepth = 0
+				}
+			}
+		}
+
+		if maskThisLine {
+			code = s.maskCodeSegment(code)
+			if comment != "" {
+				comment = s.maskCommentSegment(comment)
+			}
+		}
+
+		if inSection && !startedSectionNow {
+			sectionDepth += containerDeltaIgnoringQuotes(code)
+			if sectionDepth <= 0 {
+				inSection = false
+				sectionDepth = 0
+			}
+		}
+
+		globalBraceDepth += braceDeltaIgnoringQuotes(code)
+		if globalBraceDepth < 0 {
+			globalBraceDepth = 0
+		}
+
+		out.WriteString(code)
+		out.WriteString(comment)
+		out.WriteString(newline)
+	}
 	return out.String()
 }
 
@@ -978,6 +1136,20 @@ func parseProxyRootStart(code string, indent int) (bool, string) {
 	return true, ""
 }
 
+func parseSingboxRootStart(code string, globalBraceDepth int) (bool, string) {
+	if globalBraceDepth > 1 {
+		return false, ""
+	}
+	m := singboxRootStartRe.FindStringSubmatch(code)
+	if len(m) < 2 {
+		return false, ""
+	}
+	if len(m) >= 3 {
+		return true, m[2]
+	}
+	return true, ""
+}
+
 func leadingIndentWidth(line string) int {
 	n := 0
 	for i := 0; i < len(line); i++ {
@@ -1035,4 +1207,52 @@ func bracketDeltaIgnoringQuotes(input string) int {
 		}
 	}
 	return delta
+}
+
+func braceDeltaIgnoringQuotes(input string) int {
+	inSingle := false
+	inDouble := false
+	escaped := false
+	delta := 0
+	for i := 0; i < len(input); i++ {
+		ch := input[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if inDouble {
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inSingle {
+			if ch == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		if ch == '"' {
+			inDouble = true
+			continue
+		}
+		if ch == '\'' {
+			inSingle = true
+			continue
+		}
+		if ch == '{' {
+			delta++
+		} else if ch == '}' {
+			delta--
+		}
+	}
+	return delta
+}
+
+func containerDeltaIgnoringQuotes(input string) int {
+	return bracketDeltaIgnoringQuotes(input) + braceDeltaIgnoringQuotes(input)
 }
