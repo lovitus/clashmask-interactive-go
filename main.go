@@ -110,7 +110,7 @@ func runInteractive(reader *bufio.Reader) error {
 }
 
 func runMaskInteractive(reader *bufio.Reader) error {
-	inputPath, err := promptRequired(reader, "Input clash file path", "")
+	inputPath, err := selectMaskInputPathInteractive(reader)
 	if err != nil {
 		return err
 	}
@@ -181,6 +181,41 @@ func runMaskInteractive(reader *bufio.Reader) error {
 	fmt.Println("map file (auto-generated):", mapPath)
 	fmt.Println("To restore, run this program again and choose 2 (Unmask).")
 	return nil
+}
+
+func selectMaskInputPathInteractive(reader *bufio.Reader) (string, error) {
+	files, err := discoverYAMLFilesInDir(".")
+	if err != nil {
+		return "", err
+	}
+	if len(files) == 0 {
+		return promptRequired(reader, "No .yaml/.yml found in current folder, enter input file path", "")
+	}
+
+	fmt.Println("YAML files in current folder:")
+	for i, f := range files {
+		fmt.Printf("%d) %s\n", i+1, f)
+	}
+	fmt.Println("0) Enter path manually")
+
+	for {
+		raw, err := promptRequired(reader, "Choose file number", "1")
+		if err != nil {
+			return "", err
+		}
+		n, convErr := strconv.Atoi(strings.TrimSpace(raw))
+		if convErr != nil {
+			fmt.Println("please input a valid number")
+			continue
+		}
+		if n == 0 {
+			return promptRequired(reader, "Input clash file path", "")
+		}
+		if n >= 1 && n <= len(files) {
+			return files[n-1], nil
+		}
+		fmt.Println("number out of range")
+	}
 }
 
 func runUnmaskInteractive(reader *bufio.Reader) error {
@@ -389,6 +424,26 @@ func discoverMapFilesInCWD() ([]string, error) {
 	return files, nil
 }
 
+func discoverYAMLFilesInDir(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	files := make([]string, 0, len(entries))
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		name := ent.Name()
+		lower := strings.ToLower(name)
+		if strings.HasSuffix(lower, ".yaml") || strings.HasSuffix(lower, ".yml") {
+			files = append(files, name)
+		}
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
 func NewSanitizer(cfg Config) (*Sanitizer, error) {
 	hostKeys := cfg.HostKeys
 	if len(hostKeys) == 0 {
@@ -532,6 +587,9 @@ func (s *Sanitizer) MaskText(input string) string {
 		if maskThisLine {
 			code = s.maskCodeSegment(code)
 		}
+		if comment != "" {
+			comment = s.maskCommentSegment(comment)
+		}
 
 		if inProxies && jsonArrayMode && !startedProxiesNow {
 			jsonArrayDepth += bracketDeltaIgnoringQuotes(code)
@@ -557,6 +615,13 @@ func (s *Sanitizer) maskCodeSegment(code string) string {
 	masked = s.replaceURICredentials(masked)
 	masked = s.replaceURIHosts(masked)
 	return masked
+}
+
+func (s *Sanitizer) maskCommentSegment(comment string) string {
+	if strings.TrimSpace(comment) == "" {
+		return comment
+	}
+	return s.maskCodeSegment(comment)
 }
 
 func (s *Sanitizer) replaceKV(input string, re *regexp.Regexp, tokenFn func(string) string) string {
