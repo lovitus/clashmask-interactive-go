@@ -597,7 +597,34 @@ func (s *Sanitizer) MaskText(input string) string {
 	// Each masker is already constrained to its own root sections.
 	out := s.maskClashText(input)
 	out = s.maskSingboxText(out)
+	out = s.maskTopLevelProxyArrayText(out)
 	return out
+}
+
+func (s *Sanitizer) maskTopLevelProxyArrayText(input string) string {
+	if !isLikelyTopLevelProxyArray(input) {
+		return input
+	}
+	return s.maskCodeSegment(input)
+}
+
+func isLikelyTopLevelProxyArray(input string) bool {
+	trim := strings.TrimSpace(input)
+	if !strings.HasPrefix(trim, "[") {
+		return false
+	}
+	lower := strings.ToLower(trim)
+	if !strings.Contains(lower, `"server"`) {
+		return false
+	}
+	if strings.Contains(lower, `"password"`) || strings.Contains(lower, `"uuid"`) || strings.Contains(lower, `"private-key"`) || strings.Contains(lower, `"private_key"`) {
+		return true
+	}
+	// Some lists only expose host and type initially.
+	if strings.Contains(lower, `"type"`) {
+		return true
+	}
+	return false
 }
 
 func detectMaskMode(input string) string {
