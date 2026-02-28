@@ -175,6 +175,7 @@ func runMaskInteractive(reader *bufio.Reader) error {
 	}
 
 	masked := sanitizer.MaskText(string(data))
+	tokenCount := len(sanitizer.hostTokenToOriginal) + len(sanitizer.secretTokenToOriginal)
 	if err := os.WriteFile(outPath, []byte(masked), 0o644); err != nil {
 		return err
 	}
@@ -186,6 +187,10 @@ func runMaskInteractive(reader *bufio.Reader) error {
 	fmt.Println("Mask complete")
 	fmt.Println("masked file:", outPath)
 	fmt.Println("map file (auto-generated):", mapPath)
+	fmt.Println("generated tokens:", tokenCount)
+	if tokenCount == 0 {
+		fmt.Println("warning: no target fields matched in selected scope")
+	}
 	fmt.Println("To restore, run this program again and choose 2 (Unmask).")
 	return nil
 }
@@ -588,11 +593,11 @@ func leftPadInt(n int, width int) string {
 }
 
 func (s *Sanitizer) MaskText(input string) string {
-	mode := detectMaskMode(input)
-	if mode == maskModeSingbox {
-		return s.maskSingboxText(input)
-	}
-	return s.maskClashText(input)
+	// Run both scoped maskers to avoid false-negative mode detection.
+	// Each masker is already constrained to its own root sections.
+	out := s.maskClashText(input)
+	out = s.maskSingboxText(out)
+	return out
 }
 
 func detectMaskMode(input string) string {
